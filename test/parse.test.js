@@ -46,6 +46,25 @@ test('extractSheetListFromHtml supports non-adjacent title fields', () => {
   ]);
 });
 
+test('extractSheetListFromHtml parses htmlview items.push name-gid pairs', () => {
+  const html = `
+    <script>
+      items.push({name: "发布计划", pageUrl: "https:\\/\\/docs.google.com\\/spreadsheets\\/d\\/doc123\\/htmlview\\/sheet?headers\\x3dtrue&gid=2118959825", gid: "2118959825"});
+      items.push({name: "Android1.2.3", pageUrl: "https:\\/\\/docs.google.com\\/spreadsheets\\/d\\/doc123\\/htmlview\\/sheet?headers\\x3dtrue&gid=638061341", gid: "638061341"});
+      items.push({name: "iOS1.2.3", pageUrl: "https:\\/\\/docs.google.com\\/spreadsheets\\/d\\/doc123\\/htmlview\\/sheet?headers\\x3dtrue&gid=508915592", gid: "508915592"});
+      items.push({name: "備份表格", pageUrl: "https:\\/\\/docs.google.com\\/spreadsheets\\/d\\/doc123\\/htmlview\\/sheet?headers\\x3dtrue&gid=2006995752", gid: "2006995752"});
+    </script>
+  `;
+
+  const sheets = extractSheetListFromHtml(html);
+  assert.deepEqual(sheets, [
+    { gid: '2118959825', title: '发布计划', index: 0 },
+    { gid: '638061341', title: 'Android1.2.3', index: 1 },
+    { gid: '508915592', title: 'iOS1.2.3', index: 2 },
+    { gid: '2006995752', title: '備份表格', index: 3 },
+  ]);
+});
+
 test('extractSheetListFromHtml parses htmlview gid anchors', () => {
   const html = `
     <div id="sheet-menu">
@@ -96,6 +115,21 @@ test('extractSheetListFromHtml upgrades fallback title when better title appears
   const sheets = extractSheetListFromHtml(html);
   assert.deepEqual(sheets, [
     { gid: '2118959825', title: '版本计划', index: 0 },
+  ]);
+});
+
+test('extractSheetListFromHtml keeps gid-title mapping when title appears before sheetId', () => {
+  const html = `
+    {"properties":{"title":"发布计划","sheetId":2118959825}}
+    {"properties":{"title":"Android1.2.3","sheetId":638061341}}
+    {"properties":{"title":"iOS1.2.3","sheetId":508915592}}
+  `;
+
+  const sheets = extractSheetListFromHtml(html);
+  assert.deepEqual(sheets, [
+    { gid: '2118959825', title: '发布计划', index: 0 },
+    { gid: '638061341', title: 'Android1.2.3', index: 1 },
+    { gid: '508915592', title: 'iOS1.2.3', index: 2 },
   ]);
 });
 

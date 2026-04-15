@@ -31,6 +31,16 @@ function decodeMaybeSingleQuoted(value) {
 }
 
 /**
+ * Decode JS-like escaped string fragments (supports `\xNN` + JSON escapes).
+ *
+ * 解码 JS 风格转义字符串（支持 `\xNN` 与 JSON 转义）。
+ */
+function decodeJsEscapedString(value) {
+  const withHexDecoded = String(value || '').replace(/\\x([0-9a-fA-F]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+  return decodeEscapedString(withHexDecoded);
+}
+
+/**
  * htmlview often embeds HTML entities in tab labels.
  *
  * htmlview 里的工作表标题常包含 HTML 实体，需要先还原。
@@ -61,6 +71,50 @@ function stripHtmlTags(value) {
  */
 function normalizeTitleText(value) {
   return decodeHtmlEntities(stripHtmlTags(String(value || ''))).replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Detect and repair left-shifted gid-title mappings.
+ *
+ * 检测并修复 gid-title 整体左移错位。
+ */
+function repairShiftedTitlesIfNeeded(list, reverseTitleByGid) {
+  const sheets = Array.isArray(list) ? list : [];
+  if (!sheets.length || !(reverseTitleByGid instanceof Map) || reverseTitleByGid.size < 3) {
+    return;
+  }
+
+  let comparable = 0;
+  let shiftedMatches = 0;
+  for (let i = 0; i < sheets.length - 1; i += 1) {
+    const current = sheets[i];
+    const next = sheets[i + 1];
+    const currentTitle = normalizeTitleText(current?.title || '');
+    const reverseCurrent = normalizeTitleText(reverseTitleByGid.get(String(current?.gid || '')) || '');
+    const reverseNext = normalizeTitleText(reverseTitleByGid.get(String(next?.gid || '')) || '');
+
+    if (!currentTitle || !reverseCurrent || !reverseNext) {
+      continue;
+    }
+
+    comparable += 1;
+    if (currentTitle === reverseNext && currentTitle !== reverseCurrent) {
+      shiftedMatches += 1;
+    }
+  }
+
+  const needsRepair = comparable >= 2 && shiftedMatches >= Math.max(2, Math.floor(comparable * 0.6));
+  if (!needsRepair) {
+    return;
+  }
+
+  for (const sheet of sheets) {
+    const gid = String(sheet?.gid || '').trim();
+    const repaired = normalizeTitleText(reverseTitleByGid.get(gid) || '');
+    if (gid && repaired) {
+      sheet.title = repaired;
+    }
+  }
 }
 
 /**
@@ -102,6 +156,69 @@ function pickTitleFromChunk(chunk) {
 }
 
 /**
+ * Find the last title-like field in a text fragment.
+ *
+ * 在文本片段里找最后一个 title/name 字段。
+ */
+function pickLastTitleFromText(text) {
+  const source = String(text || '');
+  let last = null;
+
+  const doublePattern = /(?:["']?(?:title|name)["']?)\s*:\s*"((?:\\.|[^"\\])*)"/g;
+  let match;
+  while ((match = doublePattern.exec(source)) !== null) {
+    last = {
+      index: match.index,
+      value: decodeEscapedString(match[1]),
+    };
+  }
+
+  const singlePattern = /(?:["']?(?:title|name)["']?)\s*:\s*'((?:\\.|[^'\\])*)'/g;
+  while ((match = singlePattern.exec(source)) !== null) {
+    if (!last || match.index >= last.index) {
+      last = {
+        index: match.index,
+        value: decodeMaybeSingleQuoted(match[1]),
+      };
+    }
+  }
+
+  return last ? String(last.value || '') : '';
+}
+
+/**
+ * Read the last title-like token before a target index.
+ *
+ * 提取目标索引之前最近一次出现的标题字段。
+ */
+function pickLastTitleBeforeIndex(input, targetIndex, rangeStart = 0) {
+  const text = String(input || '');
+  const start = Math.max(0, Number(rangeStart) || 0);
+  const end = Math.max(start, Math.min(text.length, Number(targetIndex) || 0));
+  if (end <= start) {
+    return '';
+  }
+  return pickLastTitleFromText(text.slice(start, end));
+}
+
+/**
+ * Limit a sheetId-tail chunk to the likely current object segment.
+ *
+ * 将 sheetId 之后的片段限制在当前对象范围，避免误读到下一个对象的标题。
+ */
+function sliceLikelyObjectTail(chunk) {
+  const text = String(chunk || '');
+  // Typical object boundary between sibling entries:
+  //   ...}, { ... } / ...}{...} / ...},[...
+  // Keep content before that boundary to avoid cross-object title shifts.
+  const boundaryMatch = /}\s*,?\s*[{[]/.exec(text);
+  if (!boundaryMatch) {
+    return text;
+  }
+  return text.slice(0, boundaryMatch.index + 1);
+}
+
+/**
  * Extract worksheet list from HTML using layered heuristics.
  *
  * 使用分层启发式策略，从 HTML 中提取工作表列表。
@@ -110,6 +227,7 @@ export function extractSheetListFromHtml(html) {
   const input = String(html || '');
   const list = [];
   const indexByGid = new Map();
+  const reverseTitleByGid = new Map();
 
   /**
    * Add or upgrade a worksheet record while preserving first-seen order.
@@ -142,6 +260,62 @@ export function extractSheetListFromHtml(html) {
     });
   };
 
+  // High-confidence htmlview parser:
+  // many pages embed worksheet switcher data as:
+  //   items.push({name: "...", pageUrl: "...gid=123", gid: "123"})
+  //
+  // 高置信解析：htmlview 常以 items.push(...) 内联真实 name/gid。
+  const pushItemDouble = /items\.push\(\{\s*name:\s*"((?:\\.|[^"\\])*)"\s*,[\s\S]{0,500}?\bgid:\s*"(\d+)"/g;
+  let match;
+  while ((match = pushItemDouble.exec(input)) !== null) {
+    add(match[2], decodeJsEscapedString(match[1]));
+    if (list.length >= 1000) {
+      break;
+    }
+  }
+
+  if (list.length < 1000) {
+    const pushItemSingle = /items\.push\(\{\s*name:\s*'((?:\\.|[^'\\])*)'\s*,[\s\S]{0,500}?\bgid:\s*'(\d+)'/g;
+    while ((match = pushItemSingle.exec(input)) !== null) {
+      add(match[2], decodeMaybeSingleQuoted(match[1]));
+      if (list.length >= 1000) {
+        break;
+      }
+    }
+  }
+
+  if (list.length < 1000) {
+    const pushItemUrlDouble = /items\.push\(\{\s*name:\s*"((?:\\.|[^"\\])*)"\s*,\s*pageUrl:\s*"((?:\\.|[^"\\])*)"/g;
+    while ((match = pushItemUrlDouble.exec(input)) !== null) {
+      const title = decodeJsEscapedString(match[1]);
+      const pageUrl = decodeJsEscapedString(match[2]);
+      const gidMatch = /[?#&]gid=(\d+)/.exec(pageUrl);
+      if (!gidMatch) {
+        continue;
+      }
+      add(gidMatch[1], title);
+      if (list.length >= 1000) {
+        break;
+      }
+    }
+  }
+
+  if (list.length < 1000) {
+    const pushItemUrlSingle = /items\.push\(\{\s*name:\s*'((?:\\.|[^'\\])*)'\s*,\s*pageUrl:\s*'((?:\\.|[^'\\])*)'/g;
+    while ((match = pushItemUrlSingle.exec(input)) !== null) {
+      const title = decodeMaybeSingleQuoted(match[1]);
+      const pageUrl = decodeMaybeSingleQuoted(match[2]);
+      const gidMatch = /[?#&]gid=(\d+)/.exec(pageUrl);
+      if (!gidMatch) {
+        continue;
+      }
+      add(gidMatch[1], title);
+      if (list.length >= 1000) {
+        break;
+      }
+    }
+  }
+
   // Metadata shape is unstable across edit/htmlview pages.
   // - key order can vary; keys may be quoted or unquoted.
   // - title key may be "title" or "name".
@@ -150,27 +324,65 @@ export function extractSheetListFromHtml(html) {
   // - 字段顺序会变，key 可能有引号也可能没有。
   // - 标题字段可能是 "title" 或 "name"。
   const chunkPattern = /(?:["']?sheetId["']?)\s*:\s*(\d+)([\s\S]*?)(?=(?:["']?sheetId["']?\s*:)|$)/g;
-
-  let match;
+  const sheetIdMatches = [];
+  match = undefined;
   while ((match = chunkPattern.exec(input)) !== null) {
-    const gid = String(match[1] || '').trim();
-    const tail = String(match[2] || '');
-    const title = pickTitleFromChunk(tail);
-    if (title) {
-      add(gid, title);
-    }
-    if (list.length >= 1000) {
+    sheetIdMatches.push({
+      gid: String(match[1] || '').trim(),
+      index: match.index,
+      tail: sliceLikelyObjectTail(match[2] || ''),
+    });
+    if (sheetIdMatches.length >= 1000) {
       break;
+    }
+  }
+
+  for (let i = 0; i < sheetIdMatches.length; i += 1) {
+    const current = sheetIdMatches[i];
+    const gid = current.gid;
+    if (!gid) {
+      continue;
+    }
+
+    const rangeStart = i > 0 ? sheetIdMatches[i - 1].index : 0;
+    const beforeTitle = pickLastTitleBeforeIndex(input, current.index, rangeStart);
+    if (beforeTitle && !reverseTitleByGid.has(gid)) {
+      reverseTitleByGid.set(gid, beforeTitle);
+    }
+
+    const tailTitle = pickTitleFromChunk(current.tail);
+    if (tailTitle) {
+      add(gid, tailTitle);
+    } else if (beforeTitle) {
+      add(gid, beforeTitle);
     }
   }
 
   // Fallback for payloads where title appears before sheetId.
   //
   // 兼容 title 在 sheetId 前面的对象结构。
-  if (list.length === 0) {
-    const reversePattern = /(?:["']?(?:title|name)["']?)\s*:\s*"((?:\\.|[^"\\])*)"[\s\S]{0,800}?(?:["']?sheetId["']?)\s*:\s*(\d+)/g;
-    while ((match = reversePattern.exec(input)) !== null) {
-      add(match[2], decodeEscapedString(match[1]));
+  const reversePatternDouble = /(?:["']?(?:title|name)["']?)\s*:\s*"((?:\\.|[^"\\])*)"[\s\S]{0,800}?(?:["']?sheetId["']?)\s*:\s*(\d+)/g;
+  while ((match = reversePatternDouble.exec(input)) !== null) {
+    const gid = String(match[2] || '').trim();
+    const title = decodeEscapedString(match[1]);
+    if (gid) {
+      reverseTitleByGid.set(gid, title);
+    }
+    add(gid, title);
+    if (list.length >= 1000) {
+      break;
+    }
+  }
+
+  if (list.length < 1000) {
+    const reversePatternSingle = /(?:["']?(?:title|name)["']?)\s*:\s*'((?:\\.|[^'\\])*)'[\s\S]{0,800}?(?:["']?sheetId["']?)\s*:\s*(\d+)/g;
+    while ((match = reversePatternSingle.exec(input)) !== null) {
+      const gid = String(match[2] || '').trim();
+      const title = decodeMaybeSingleQuoted(match[1]);
+      if (gid && !reverseTitleByGid.has(gid)) {
+        reverseTitleByGid.set(gid, title);
+      }
+      add(gid, title);
       if (list.length >= 1000) {
         break;
       }
@@ -272,6 +484,8 @@ export function extractSheetListFromHtml(html) {
       }
     }
   }
+
+  repairShiftedTitlesIfNeeded(list, reverseTitleByGid);
 
   return list;
 }

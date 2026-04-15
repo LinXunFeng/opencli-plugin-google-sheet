@@ -361,6 +361,191 @@ function mergeSheetTitles(baseSheets, ...sourceLists) {
 }
 
 /**
+ * Normalize worksheet title strings collected from live page probes.
+ *
+ * 规范化从页面探测得到的工作表标题文本。
+ */
+function normalizeWorksheetTitle(value) {
+  const raw = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!raw) {
+    return '';
+  }
+  return raw.replace(/\s*[-|]\s*Google(?:\s+Sheets|\s+\S+表格)?\s*$/i, '').trim();
+}
+
+/**
+ * Verify gid-title mapping by visiting each gid and reading active tab label.
+ * This is slower but provides a high-confidence correction path.
+ *
+ * 通过逐个 gid 跳转并读取当前激活 tab 标题来校验映射。
+ * 该路径更慢，但可作为高置信度纠偏方案。
+ */
+async function tryResolveTitlesByGidNavigation(page, docId, sheets) {
+  if (!page || typeof page.goto !== 'function' || typeof page.evaluate !== 'function') {
+    return null;
+  }
+
+  const targets = (Array.isArray(sheets) ? sheets : []).slice(0, 12);
+  if (targets.length < 2) {
+    return null;
+  }
+
+  const resolved = [];
+  for (const sheet of targets) {
+    const gid = String(sheet?.gid || '').trim();
+    if (!gid) {
+      continue;
+    }
+
+    try {
+      await page.goto(buildSheetEditUrl(docId, gid));
+      if (typeof page.wait === 'function') {
+        await page.wait(1);
+      }
+
+      const title = await page.evaluate(`
+        (() => new Promise((resolve) => {
+          // verify title by gid navigation
+          const targetGid = ${JSON.stringify(gid)};
+          const deadline = Date.now() + 8000;
+
+          const normalizeTitle = (value) => {
+            const raw = String(value || '').replace(/\\s+/g, ' ').trim();
+            if (!raw) return '';
+            return raw.replace(/\\s*[-|]\\s*Google(?:\\s+Sheets|\\s+\\S+表格)?\\s*$/i, '').trim();
+          };
+
+          const gidFromText = (text) => {
+            const match = String(text || '').match(/[?#&]gid=(\\d+)/);
+            return match ? match[1] : '';
+          };
+
+          const gidFromNode = (node) => {
+            if (!node) return '';
+            const idMatch = String(node.id || '').match(/sheet-button-(\\d+)/);
+            const fromId = idMatch ? idMatch[1] : '';
+            const fromData = String(
+              (node.dataset && (node.dataset.gid || node.dataset.sheetId))
+              || (node.getAttribute && (node.getAttribute('data-gid') || node.getAttribute('data-sheet-id')))
+              || ''
+            ).trim();
+            const fromHref = gidFromText(node.getAttribute && node.getAttribute('href'));
+            return String(fromId || fromData || fromHref || '').trim();
+          };
+
+          const readTitle = (node) => {
+            if (!node) return '';
+            return normalizeTitle(
+              (node.getAttribute && (node.getAttribute('aria-label') || node.getAttribute('data-tooltip') || node.getAttribute('title')))
+              || node.textContent
+              || ''
+            );
+          };
+
+          const isActiveNode = (node) => {
+            if (!node) return false;
+            const ariaSelected = String(node.getAttribute && node.getAttribute('aria-selected') || '').toLowerCase() === 'true';
+            const ariaCurrent = String(node.getAttribute && node.getAttribute('aria-current') || '').toLowerCase() === 'true';
+            const className = String(node.className || '');
+            return ariaSelected || ariaCurrent || /active|selected|current/i.test(className);
+          };
+
+          const getTabNodes = () => Array.from(
+            document.querySelectorAll('[id^="sheet-button-"], [role="tab"], a[href*="gid="], [data-gid], [data-sheet-id]')
+          );
+
+          const readActiveTargetTitle = () => {
+            for (const node of getTabNodes()) {
+              if (!isActiveNode(node)) continue;
+              const nodeGid = gidFromNode(node);
+              if (nodeGid && nodeGid !== targetGid) continue;
+              const title = readTitle(node);
+              if (title) return title;
+            }
+            return '';
+          };
+
+          const clickTargetTab = () => {
+            for (const node of getTabNodes()) {
+              if (gidFromNode(node) !== targetGid) continue;
+              try {
+                if (typeof node.click === 'function') {
+                  node.click();
+                  return true;
+                }
+                if (typeof node.dispatchEvent === 'function') {
+                  node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                  return true;
+                }
+              } catch {
+                // ignore click errors
+              }
+            }
+            return false;
+          };
+
+          const readTargetNodeTitle = () => {
+            for (const node of getTabNodes()) {
+              if (gidFromNode(node) !== targetGid) continue;
+              const title = readTitle(node);
+              if (title) return title;
+            }
+            return '';
+          };
+
+          const tick = () => {
+            const activeTitle = readActiveTargetTitle();
+            if (activeTitle) {
+              resolve(activeTitle);
+              return;
+            }
+
+            const clicked = clickTargetTab();
+            if (Date.now() >= deadline) {
+              const byNode = readTargetNodeTitle();
+              if (byNode) {
+                resolve(byNode);
+                return;
+              }
+
+              const fromUrl = gidFromText(location.href);
+              if (fromUrl === targetGid) {
+                resolve(normalizeTitle(document.title || ''));
+                return;
+              }
+              resolve('');
+              return;
+            }
+
+            setTimeout(tick, clicked ? 350 : 200);
+          };
+
+          tick();
+        }))()
+      `);
+
+      const normalized = normalizeWorksheetTitle(title);
+      if (normalized && !isGenericWorksheetTitle(normalized, gid)) {
+        resolved.push({ gid, title: normalized });
+      }
+    } catch {
+      // keep best-effort behavior
+    }
+  }
+
+  if (resolved.length < 2) {
+    return null;
+  }
+
+  const uniqueTitles = new Set(resolved.map((item) => String(item.title || '').toLowerCase()));
+  if (uniqueTitles.size < Math.max(2, Math.floor(resolved.length * 0.6))) {
+    return null;
+  }
+
+  return resolved;
+}
+
+/**
  * Final fallback for row extraction.
  * Reads currently visible grid cells from DOM after navigating to the sheet.
  *
@@ -478,6 +663,13 @@ async function tryExtractSheetsFromLoadedPage(page, editUrl) {
           return match ? match[1] : '';
         };
 
+        const sliceLikelyObjectTail = (value) => {
+          const text = String(value || '');
+          const boundaryMatch = /}\\s*,?\\s*[{[]/.exec(text);
+          if (!boundaryMatch) return text;
+          return text.slice(0, boundaryMatch.index + 1);
+        };
+
         const collect = () => {
           const out = [];
           const seen = new Set();
@@ -486,7 +678,10 @@ async function tryExtractSheetsFromLoadedPage(page, editUrl) {
 
           const add = (gidValue, titleValue, source) => {
             const gid = String(gidValue || '').trim();
-            if (!gid || seen.has(gid)) return;
+            if (!gid) return;
+            if (seen.has(gid)) {
+              return;
+            }
             seen.add(gid);
             out.push({
               gid,
@@ -533,7 +728,7 @@ async function tryExtractSheetsFromLoadedPage(page, editUrl) {
                 continue;
               }
 
-              const chunk = String(match[2] || '');
+              const chunk = sliceLikelyObjectTail(match[2] || '');
               const titleDouble = /(?:["']?(?:title|name)["']?)\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"/.exec(chunk);
               const titleSingle = /(?:["']?(?:title|name)["']?)\\s*:\\s*'((?:\\\\.|[^'\\\\])*)'/.exec(chunk);
               let title = '';
@@ -557,6 +752,39 @@ async function tryExtractSheetsFromLoadedPage(page, editUrl) {
               add(gid, title, 'html');
               if (out.length >= 500) {
                 break;
+              }
+            }
+
+            const reverseDouble = /(?:["']?(?:title|name)["']?)\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"([\\s\\S]{0,800}?)(?:["']?sheetId["']?)\\s*:\\s*(\\d+)/g;
+            while ((match = reverseDouble.exec(html)) !== null) {
+              const gid = String(match[3] || '').trim();
+              if (!gid || seen.has(gid)) {
+                continue;
+              }
+              let title = String(match[1] || '');
+              try {
+                title = JSON.parse('"' + title.replace(/"/g, '\\\\\\"') + '"');
+              } catch {
+                // keep raw title
+              }
+              add(gid, title, 'html');
+              if (out.length >= 500) {
+                break;
+              }
+            }
+
+            if (out.length < 500) {
+              const reverseSingle = /(?:["']?(?:title|name)["']?)\\s*:\\s*'((?:\\\\.|[^'\\\\])*)'([\\s\\S]{0,800}?)(?:["']?sheetId["']?)\\s*:\\s*(\\d+)/g;
+              while ((match = reverseSingle.exec(html)) !== null) {
+                const gid = String(match[3] || '').trim();
+                if (!gid || seen.has(gid)) {
+                  continue;
+                }
+                const title = String(match[1] || '').replace(/\\\\'/g, "'");
+                add(gid, title, 'html');
+                if (out.length >= 500) {
+                  break;
+                }
               }
             }
           }
@@ -819,20 +1047,15 @@ export async function fetchWorkbookMeta(page, docId) {
   const url = buildDocUrl(docId, 'edit');
   const pageExtraction = await tryExtractSheetsFromLoadedPage(page, url);
   const pageSheets = Array.isArray(pageExtraction?.sheets) ? pageExtraction.sheets : [];
-  // "Weak" means we have some gids, but confidence is low (often single fallback gid).
-  //
-  // “弱结果”表示虽有 gid，但置信度低（通常只有当前页 gid）。
   const hasWeakPageSheets = pageSheets.length > 0 && !Boolean(pageExtraction?.confident);
-  if (pageExtraction?.confident && pageSheets.length > 0) {
-    return hydrateWorksheetTitles(page, docId, pageSheets);
-  }
 
   let response;
   try {
     response = await fetchWithSession(page, url);
   } catch (error) {
-    if (hasWeakPageSheets) {
-      return pageSheets;
+    if (pageSheets.length > 0) {
+      const hydrated = await hydrateWorksheetTitles(page, docId, pageSheets);
+      return hydrated;
     }
     throw error;
   }
@@ -845,8 +1068,9 @@ export async function fetchWorkbookMeta(page, docId) {
   try {
     ensureAuthorized(response);
   } catch (error) {
-    if (hasWeakPageSheets) {
-      return pageSheets;
+    if (pageSheets.length > 0) {
+      const hydrated = await hydrateWorksheetTitles(page, docId, pageSheets);
+      return hydrated;
     }
     throw error;
   }
@@ -861,12 +1085,16 @@ export async function fetchWorkbookMeta(page, docId) {
 
   const sheets = extractSheetListFromHtml(body);
   let selectedSheets = sheets;
+  if (isBetterSheetListCandidate(pageSheets, selectedSheets)) {
+    selectedSheets = pageSheets;
+  }
+
   if (selectedSheets.length <= 1) {
     // edit page may only expose one tab; htmlview usually contains full tab list.
     //
     // edit 页面有时只暴露一个 tab，htmlview 通常能拿到完整列表。
     const htmlViewSheets = await tryFetchWorkbookMetaFromHtmlView(page, docId);
-    if (htmlViewSheets && htmlViewSheets.length > selectedSheets.length && htmlViewSheets.length > pageSheets.length) {
+    if (isBetterSheetListCandidate(htmlViewSheets, selectedSheets) && htmlViewSheets.length > pageSheets.length) {
       selectedSheets = htmlViewSheets;
     }
   }
@@ -889,7 +1117,41 @@ export async function fetchWorkbookMeta(page, docId) {
     );
   }
 
-  return hydrateWorksheetTitles(page, docId, selectedSheets, sheets, pageSheets);
+  const hydrated = await hydrateWorksheetTitles(page, docId, selectedSheets, sheets, pageSheets);
+  const verifiedTitles = await tryResolveTitlesByGidNavigation(page, docId, hydrated);
+  if (!verifiedTitles || verifiedTitles.length === 0) {
+    return hydrated;
+  }
+
+  const titleByGid = new Map(
+    verifiedTitles.map((entry) => [String(entry.gid || '').trim(), String(entry.title || '').trim()]),
+  );
+
+  let diffCount = 0;
+  const corrected = hydrated.map((sheet, index) => {
+    const gid = String(sheet?.gid || '').trim();
+    const nextTitle = normalizeWorksheetTitle(titleByGid.get(gid) || '');
+    const currentTitle = normalizeWorksheetTitle(sheet?.title || '');
+    if (!gid || !nextTitle) {
+      return {
+        gid,
+        title: currentTitle || `Sheet_${gid}`,
+        index: Number.isFinite(sheet?.index) ? sheet.index : index,
+      };
+    }
+    if (nextTitle !== currentTitle) {
+      diffCount += 1;
+    }
+    return {
+      gid,
+      title: nextTitle,
+      index: Number.isFinite(sheet?.index) ? sheet.index : index,
+    };
+  });
+
+  // Require at least one concrete diff before overriding.
+  const finalSheets = diffCount > 0 ? corrected : hydrated;
+  return finalSheets;
 }
 
 /**
