@@ -13,10 +13,13 @@ WeChat tech group: [Group details](https://mp.weixin.qq.com/s/JBbMstn0qW6M71hh-B
 ## 📦 Install
 
 ```bash
+# Install from GitHub
+opencli plugin install github:LinXunFeng/opencli-plugin-google-sheet
+
 # Local path install (replace with your absolute path)
 opencli plugin install /absolute/path/to/opencli-plugin-google-sheet
 
-# Update after install (common for local symlink setup)
+# Update after install
 opencli plugin update google-sheet
 ```
 

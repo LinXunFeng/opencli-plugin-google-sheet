@@ -13,10 +13,13 @@
 ## 📦 安装
 
 ```bash
+# 通过 GitHub 安装
+opencli plugin install github:LinXunFeng/opencli-plugin-google-sheet
+
 # 本地路径安装（请替换为你的绝对路径）
 opencli plugin install /absolute/path/to/opencli-plugin-google-sheet
 
-# 已安装后更新（本地软链接场景常用）
+# 已安装后更新
 opencli plugin update google-sheet
 ```
 
