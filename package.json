@@ -1,0 +1,12 @@
+{
+  "name": "opencli-plugin-google-sheet",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Google Sheets adapter for docId-based reads",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "peerDependencies": {
+    "@jackwener/opencli": ">=1.7.3"
+  }
+}

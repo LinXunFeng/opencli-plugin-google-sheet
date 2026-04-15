@@ -1,0 +1,6 @@
+{
+  "name": "google-sheet",
+  "version": "0.0.1",
+  "description": "Google Sheets adapter for docId-based reads",
+  "opencli": ">=1.7.3"
+}
