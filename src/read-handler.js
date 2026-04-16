@@ -9,6 +9,7 @@ import { fetchSheetRows, fetchWorkbookMeta } from './sheets-api.js';
  */
 
 const TABULAR_FORMATS = new Set(['table', 'csv', 'md', 'markdown', 'plain']);
+const PLUGIN_SOURCE = 'opencli-plugin-google-sheet@0.0.1';
 
 /**
  * Return true when a value is non-empty after trimming.
@@ -113,12 +114,15 @@ export function createReadHandler(deps = {}) {
 
   return async function readHandler(page, kwargs) {
     const docId = kwargs.docId;
-    const sheetSelector = kwargs.sheet;
-    const sheets = await getWorkbookMeta(page, docId);
+    const sheetSelector = String(kwargs.sheet ?? '').trim();
     const format = requestedFormat(process.argv, kwargs);
     const tabular = TABULAR_FORMATS.has(format);
 
+    // No selector means "list workbook tabs" mode, not "read rows" mode.
+    //
+    // 未传 --sheet 时进入“列出工作表”模式，而不是读取行数据。
     if (!sheetSelector) {
+      const sheets = await getWorkbookMeta(page, docId);
       if (tabular) {
         return sheets.map((sheet) => ({
           gid: sheet.gid,
@@ -134,16 +138,47 @@ export function createReadHandler(deps = {}) {
       };
     }
 
-    // Allow direct gid reads even when sheet list extraction is partial.
+    // Fast path for numeric gid:
+    // read rows directly without fetching full workbook metadata.
+    // This avoids extra tab probing/navigation in metadata hydration.
     //
-    // 即使工作表列表提取不完整，也允许通过 gid 直接读取。
-    let target = resolveSheet(sheets, sheetSelector);
-    if (!target && isLikelyGid(sheetSelector)) {
-      target = {
-        gid: String(sheetSelector).trim(),
-        title: `gid:${String(sheetSelector).trim()}`,
+    // 数字 gid 的快速路径：
+    // 直接按 gid 读行数据，不先拉全量工作簿元数据，
+    // 以避免元数据补全阶段可能触发的额外 tab 探测/切换。
+    if (isLikelyGid(sheetSelector)) {
+      const gid = sheetSelector;
+      const parsedRows = await getSheetRows(page, docId, gid);
+      const columns = buildColumnNames(parsedRows);
+      const bodyRows = isHeaderRow(parsedRows[0]) ? parsedRows.slice(1) : parsedRows;
+      const colCount = columns.length || bodyRows.reduce((max, row) => Math.max(max, row.length), 0);
+
+      if (tabular) {
+        return toTableRows(columns.length ? columns : Array.from({ length: colCount }, (_, i) => `col_${i + 1}`), bodyRows);
+      }
+
+      return {
+        docId,
+        sheet: {
+          gid,
+          title: `gid:${gid}`,
+        },
+        columns: columns.length ? columns : Array.from({ length: colCount }, (_, i) => `col_${i + 1}`),
+        rows: bodyRows,
+        meta: {
+          rowCount: bodyRows.length,
+          colCount,
+          fetchedAt: now(),
+          source: PLUGIN_SOURCE,
+        },
       };
     }
+
+    // Title-based selector requires workbook metadata for title→gid resolution.
+    //
+    // 标题选择器需要先读取工作簿元数据，完成 title → gid 映射。
+    const sheets = await getWorkbookMeta(page, docId);
+
+    let target = resolveSheet(sheets, sheetSelector);
 
     if (!target) {
       throw createGoogleSheetError(
@@ -174,7 +209,7 @@ export function createReadHandler(deps = {}) {
         rowCount: bodyRows.length,
         colCount,
         fetchedAt: now(),
-        source: 'opencli-plugin-google-sheet@0.0.1',
+        source: PLUGIN_SOURCE,
       },
     };
   };

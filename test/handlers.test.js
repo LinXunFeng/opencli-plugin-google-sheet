@@ -102,6 +102,24 @@ test('read handler accepts numeric gid even when sheet list is incomplete', asyn
   assert.deepEqual(result.rows, [['Alice', '638061341']]);
 });
 
+test('read handler skips workbook metadata lookup for numeric gid selector', async () => {
+  const handler = createReadHandler({
+    fetchWorkbookMeta: async () => {
+      throw new Error('should not fetch workbook metadata for direct gid read');
+    },
+    fetchSheetRows: async (_page, _docId, gid) => [
+      ['Name', 'Score'],
+      ['Alice', gid],
+    ],
+    getRequestedFormat: () => 'json',
+    now: () => '2026-04-14T00:00:00.000Z',
+  });
+
+  const result = await handler({}, { docId: 'doc123', sheet: '638061341' });
+  assert.deepEqual(result.sheet, { gid: '638061341', title: 'gid:638061341' });
+  assert.deepEqual(result.rows, [['Alice', '638061341']]);
+});
+
 test('toTableRows maps 2D rows into keyed objects', () => {
   const result = toTableRows(['Name', 'Score'], [['Alice', '90'], ['Bob', '80']]);
   assert.deepEqual(result, [
